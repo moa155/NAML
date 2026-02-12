@@ -1,0 +1,120 @@
+{
+  "train_losses": [
+    {
+      "classification": 0.2574628281407058,
+      "bbox_regression": 0.10190975978970528,
+      "total_loss": 0.3593725889734924
+    },
+    {
+      "classification": 0.23908111670054497,
+      "bbox_regression": 0.09238861873745918,
+      "total_loss": 0.3314697361830622
+    },
+    {
+      "classification": 0.23548533994704485,
+      "bbox_regression": 0.08919211529195309,
+      "total_loss": 0.32467745546251536
+    },
+    {
+      "classification": 0.22405098581686617,
+      "bbox_regression": 0.08725825428962708,
+      "total_loss": 0.3113092408515513
+    },
+    {
+      "classification": 0.21648155314847828,
+      "bbox_regression": 0.08713951662182808,
+      "total_loss": 0.3036210691742599
+    }
+  ],
+  "val_metrics": [
+    {
+      "AP@0.5": 0.0,
+      "AP@0.5:0.95": 0.0,
+      "AP_M": 0.0,
+      "AP_L": 0.0,
+      "AR@10": 0.0,
+      "AR_M": 0.0,
+      "AR_L": 0.0,
+      "patient_accuracy": 0.77,
+      "patient_precision": 0.0,
+      "patient_recall": 0.0,
+      "patient_f1": 0.0,
+      "precisions": [],
+      "recalls": []
+    },
+    {
+      "AP@0.5": 0.0,
+      "AP@0.5:0.95": 0.0,
+      "AP_M": 0.0,
+      "AP_L": 0.0,
+      "AR@10": 0.0,
+      "AR_M": 0.0,
+      "AR_L": 0.0,
+      "patient_accuracy": 0.77,
+      "patient_precision": 0.0,
+      "patient_recall": 0.0,
+      "patient_f1": 0.0,
+      "precisions": [],
+      "recalls": []
+    },
+    {
+      "AP@0.5": 0.0,
+      "AP@0.5:0.95": 0.0,
+      "AP_M": 0.0,
+      "AP_L": 0.0,
+      "AR@10": 0.0,
+      "AR_M": 0.0,
+      "AR_L": 0.0,
+      "patient_accuracy": 0.77,
+      "patient_precision": 0.0,
+      "patient_recall": 0.0,
+      "patient_f1": 0.0,
+      "precisions": [],
+      "recalls": []
+    },
+    {
+      "AP@0.5": 0.0,
+      "AP@0.5:0.95": 0.0,
+      "AP_M": 0.0,
+      "AP_L": 0.0,
+      "AR@10": 0.0,
+      "AR_M": 0.0,
+      "AR_L": 0.0,
+      "patient_accuracy": 0.77,
+      "patient_precision": 0.0,
+      "patient_recall": 0.0,
+      "patient_f1": 0.0,
+      "precisions": [],
+      "recalls": []
+    },
+    {
+      "AP@0.5": 0.0,
+      "AP@0.5:0.95": 0.0,
+      "AP_M": 0.0,
+      "AP_L": 0.0,
+      "AR@10": 0.0,
+      "AR_M": 0.0,
+      "AR_L": 0.0,
+      "patient_accuracy": 0.77,
+      "patient_precision": 0.0,
+      "patient_recall": 0.0,
+      "patient_f1": 0.0,
+      "precisions": [],
+      "recalls": []
+    }
+  ],
+  "epoch_times": [
+    339.12297105789185,
+    287.3756892681122,
+    287.57815408706665,
+    250.88404607772827,
+    490.7419219017029
+  ],
+  "learning_rates": [
+    0.001,
+    0.001,
+    0.001,
+    0.0001,
+    1e-05
+  ]
+}

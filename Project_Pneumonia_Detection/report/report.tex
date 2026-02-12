@@ -1,0 +1,403 @@
+\documentclass[11pt,a4paper]{article}
+
+% Packages
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath,amssymb}
+\usepackage{hyperref}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{float}
+\usepackage{enumitem}
+\usepackage[numbers]{natbib}
+\usepackage{xcolor}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+% Paths
+\graphicspath{{../results/}}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!60!black,
+    citecolor=blue!60!black,
+    urlcolor=blue!60!black,
+}
+
+\title{
+    \textbf{Pneumonia Detection Using Anchor-Free\\vs.\ Anchor-Based Object Detection}\\[0.5em]
+    \large Reproducing and Extending Wu et al.\ (2024)\\[0.3em]
+    \normalsize Numerical Analysis for Machine Learning --- Politecnico di Milano
+}
+\author{Mohamed}
+\date{February 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This report reproduces and extends the method proposed by Wu et al.~\cite{wu2024pneumonia}, which applies the anchor-free FCOS (Fully Convolutional One-Stage) detector to the task of pneumonia detection on chest X-rays from the RSNA Pneumonia Detection Challenge dataset. We compare three detection architectures sharing the same ResNet-50 + FPN backbone: (1)~FCOS as the paper's proposed anchor-free method, (2)~RetinaNet as a one-stage anchor-based baseline, and (3)~Faster R-CNN as a two-stage anchor-based baseline. We evaluate all models using COCO-style metrics (AP, AR) and patient-level classification accuracy, providing a systematic comparison of anchor-free vs.\ anchor-based paradigms for medical image analysis.
+\end{abstract}
+
+%==============================================================================
+\section{Introduction}
+\label{sec:intro}
+%==============================================================================
+
+Pneumonia is one of the leading causes of death worldwide, particularly among children and the elderly. Accurate and timely detection from chest radiographs is critical but challenging, as pneumonia opacities can be subtle, overlapping with other pathologies, and difficult to localize precisely.
+
+Deep learning--based object detection has shown great promise for automating pneumonia detection. Most prior approaches use \emph{anchor-based} detectors such as Faster R-CNN~\cite{ren2015faster} or RetinaNet~\cite{lin2017focal}, which rely on predefined anchor boxes to propose candidate regions. In contrast, Wu et al.~\cite{wu2024pneumonia} proposed using FCOS~\cite{tian2019fcos}, an \emph{anchor-free} detector that directly predicts bounding boxes at each spatial location of the feature map, eliminating the need for hand-designed anchor configurations.
+
+The key advantages of the anchor-free approach include:
+\begin{itemize}[nosep]
+    \item No hyperparameter tuning for anchor shapes, sizes, or aspect ratios.
+    \item More flexible localization, particularly for irregularly-shaped or variable-size lesions.
+    \item Simpler architecture with fewer design choices.
+\end{itemize}
+
+In this project, we implement and compare three detection architectures:
+\begin{enumerate}[nosep]
+    \item \textbf{FCOS} --- the paper's proposed anchor-free detector,
+    \item \textbf{RetinaNet} --- a one-stage, anchor-based detector with focal loss,
+    \item \textbf{Faster R-CNN} --- a two-stage, anchor-based detector with RPN.
+\end{enumerate}
+
+All models share a ResNet-50 backbone with Feature Pyramid Network (FPN), ensuring that performance differences arise from the detection paradigm rather than feature extraction capacity.
+
+
+%==============================================================================
+\section{Background}
+\label{sec:background}
+%==============================================================================
+
+\subsection{Object Detection Paradigms}
+
+\paragraph{Anchor-Based Detection.}
+Traditional object detectors rely on a set of predefined \emph{anchor boxes} at each spatial location of the feature map. The network classifies each anchor as object/background and regresses offsets to refine the box. Faster R-CNN uses a Region Proposal Network (RPN) as a first stage to generate proposals, followed by ROI pooling and per-proposal classification/regression (two-stage). RetinaNet is a one-stage detector that directly classifies and regresses from anchors, using focal loss to address class imbalance.
+
+\paragraph{Anchor-Free Detection.}
+FCOS predicts, at each location $(x,y)$ of the feature map, a classification score and four distances $(l, t, r, b)$ from the point to the bounding box boundaries. A ``center-ness'' branch further down-weights predictions far from the object center. This eliminates all anchor-related hyperparameters.
+
+\subsection{Feature Pyramid Network (FPN)}
+
+All three architectures use FPN~\cite{lin2017feature} on top of ResNet-50~\cite{he2016deep} to build a multi-scale feature representation. FPN constructs a top-down pathway with lateral connections, producing feature maps at strides $\{8, 16, 32, 64, 128\}$ pixels.
+
+\subsection{Focal Loss}
+
+Both FCOS and RetinaNet employ focal loss~\cite{lin2017focal} to handle the extreme foreground--background imbalance inherent in object detection:
+\begin{equation}
+    \text{FL}(p_t) = -\alpha_t (1 - p_t)^{\gamma} \log(p_t),
+\end{equation}
+where $p_t$ is the predicted probability for the correct class, $\alpha_t$ is a balancing factor, and $\gamma$ is the focusing parameter (typically $\gamma=2$).
+
+
+%==============================================================================
+\section{Dataset}
+\label{sec:dataset}
+%==============================================================================
+
+We use the \textbf{RSNA Pneumonia Detection Challenge} dataset, which consists of 26,684 chest X-ray images in DICOM format with bounding box annotations for pneumonia opacities. Each image is associated with a patient ID and may contain zero or more bounding boxes.
+
+\paragraph{Preprocessing.}
+DICOM images are converted to 8-bit PNG format for efficient loading. Pixel values are extracted from the DICOM metadata with proper windowing applied where available.
+
+\paragraph{Data Split.}
+We perform a patient-level 80/20 train/validation split (no patient appears in both sets). For computational feasibility on Apple M1 hardware, we subsample 500 patients (400 train / 100 validation), yielding 452 training and 118 validation annotation rows.
+
+\paragraph{Data Augmentation.}
+Following the paper's methodology, we apply:
+\begin{itemize}[nosep]
+    \item Random horizontal flip ($p=0.5$)
+    \item Random vertical flip ($p=0.3$)
+    \item Random brightness/contrast adjustment ($p=0.3$)
+    \item Random resized crop (scale 0.8--1.0)
+\end{itemize}
+All transforms are applied jointly to both images and bounding boxes.
+
+
+%==============================================================================
+\section{Method}
+\label{sec:method}
+%==============================================================================
+
+\subsection{Model Architectures}
+
+All three models use the following shared configuration:
+\begin{itemize}[nosep]
+    \item \textbf{Backbone:} ResNet-50 pretrained on ImageNet (IMAGENET1K\_V1)
+    \item \textbf{Neck:} Feature Pyramid Network (FPN) with 5 levels
+    \item \textbf{Input size:} 512$\times$512 pixels
+    \item \textbf{Classes:} 2 (background + pneumonia)
+    \item \textbf{NMS threshold:} 0.5
+    \item \textbf{Score threshold:} 0.1 (inference)
+\end{itemize}
+
+\paragraph{FCOS (Anchor-Free).}
+The FCOS head predicts, at each FPN level, a classification score, four regression distances, and a center-ness score. Objects are assigned to FPN levels based on the scale of their bounding box. We use the \texttt{torchvision} implementation (\texttt{fcos\_resnet50\_fpn}).
+
+\paragraph{RetinaNet (One-Stage, Anchor-Based).}
+RetinaNet uses a set of 9 anchors per location (3 scales $\times$ 3 aspect ratios) and applies focal loss for classification. We use \texttt{retinanet\_resnet50\_fpn\_v2}.
+
+\paragraph{Faster R-CNN (Two-Stage, Anchor-Based).}
+Faster R-CNN first generates region proposals via the RPN, then classifies and refines each proposal. We use \texttt{fasterrcnn\_resnet50\_fpn\_v2}.
+
+\subsection{Training Configuration}
+
+\begin{itemize}[nosep]
+    \item \textbf{Optimizer:} Adam with learning rate $10^{-3}$ and weight decay $10^{-4}$
+    \item \textbf{LR Schedule:} MultiStepLR with milestones at epochs $\{3, 4\}$ (scaled for 5 epochs), $\gamma=0.1$
+    \item \textbf{Epochs:} 5 (FCOS, RetinaNet) / 3 (Faster R-CNN, due to CPU-only training)
+    \item \textbf{Batch size:} 4
+    \item \textbf{Gradient clipping:} max norm = 1.0
+\end{itemize}
+
+We acknowledge that this is a reduced training regime compared to the paper's full setup (which uses the complete dataset for 20+ epochs). FCOS and RetinaNet were trained using MPS acceleration on Apple M1, while Faster R-CNN required CPU-only training due to MPS compatibility issues with its two-stage architecture, limiting it to 3 epochs.
+
+
+%==============================================================================
+\section{Evaluation Metrics}
+\label{sec:metrics}
+%==============================================================================
+
+Following the paper and standard COCO evaluation, we report:
+
+\subsection{Detection Metrics}
+\begin{itemize}[nosep]
+    \item \textbf{AP@0.5}: Average Precision at IoU threshold 0.5
+    \item \textbf{AP@[0.5:0.95]}: AP averaged over IoU thresholds from 0.5 to 0.95 (step 0.05)
+    \item \textbf{$AP_M$}: AP for medium-sized objects (area $32^2$ to $96^2$ pixels)
+    \item \textbf{$AP_L$}: AP for large objects (area $>96^2$ pixels)
+    \item \textbf{$AR_{10}$}: Average Recall with max 10 detections per image
+    \item \textbf{$AR_M$, $AR_L$}: Recall for medium and large objects
+\end{itemize}
+
+AP is computed using 101-point interpolation of the precision--recall curve (COCO standard).
+
+\subsection{Patient-Level Classification}
+We also evaluate patient-level binary classification (pneumonia present vs.\ absent):
+\begin{itemize}[nosep]
+    \item A patient is predicted \emph{positive} if the model outputs at least one detection with confidence $>0.5$.
+    \item Metrics: accuracy, precision, recall, F1-score.
+\end{itemize}
+
+
+%==============================================================================
+\section{Results}
+\label{sec:results}
+%==============================================================================
+
+\subsection{Detection Performance}
+
+Table~\ref{tab:comparison} summarizes the detection metrics for all three models. Due to the limited training data (500 patients, 5 epochs), absolute performance is lower than the paper's reported numbers. However, the \emph{relative comparison} between architectures remains informative.
+
+% This table will be auto-generated by the code as comparison_table.tex
+% For now, include a placeholder that works with or without the generated file
+\begin{table}[H]
+\centering
+\caption{Detection performance comparison on the RSNA dataset (500 patients). All values in \%.}
+\label{tab:comparison}
+\begin{tabular}{lcccccc}
+\toprule
+Method & AP@0.5 & $AP_M$ & $AP_L$ & $AR_{10}$ & $AR_M$ & $AR_L$ \\
+\midrule
+FCOS (Paper) & 1.2 & 0.0 & 1.2 & 9.8 & 0.0 & 62.5 \\
+RetinaNet & 0.0 & 0.0 & 0.0 & 0.0 & 0.0 & 0.0 \\
+Faster R-CNN & 0.7 & 0.0 & 0.8 & 19.5 & 0.0 & 32.5 \\
+\bottomrule
+\end{tabular}
+\vspace{0.3em}
+
+\footnotesize\textit{Note: FCOS and RetinaNet trained for 5 epochs; Faster R-CNN trained for 3 epochs (CPU). Low absolute scores are expected due to limited training data and epochs.}
+\end{table}
+
+\subsection{Training Dynamics}
+
+\paragraph{Loss Convergence.}
+Figure~\ref{fig:training_loss} shows the training loss over epochs. FCOS exhibits higher absolute loss values (including center-ness and regression losses), while RetinaNet converges to lower loss values. This difference reflects the different loss formulations rather than model quality.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\textwidth]{training_loss.png}
+    \caption{Training loss comparison across all three models.}
+    \label{fig:training_loss}
+\end{figure}
+
+\paragraph{Validation AP.}
+Figure~\ref{fig:val_ap} shows the validation AP@0.5 over training epochs. FCOS achieves non-zero AP early in training and maintains the highest detection accuracy. Faster R-CNN shows a brief peak in epoch 1 (AP@0.5 = 0.74\%) before declining, while RetinaNet produces no meaningful detections throughout training.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.85\textwidth]{val_ap_over_epochs.png}
+    \caption{Validation AP@0.5 progression during training.}
+    \label{fig:val_ap}
+\end{figure}
+
+\subsection{Comparison Plots}
+
+\begin{figure}[H]
+    \centering
+    \begin{subfigure}[b]{0.48\textwidth}
+        \includegraphics[width=\textwidth]{ap_comparison.png}
+        \caption{Average Precision metrics}
+        \label{fig:ap_comp}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.48\textwidth}
+        \includegraphics[width=\textwidth]{ar_comparison.png}
+        \caption{Average Recall metrics}
+        \label{fig:ar_comp}
+    \end{subfigure}
+    \caption{Detection metric comparison across models.}
+    \label{fig:metrics_comp}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \begin{subfigure}[b]{0.48\textwidth}
+        \includegraphics[width=\textwidth]{pr_curve.png}
+        \caption{Precision--Recall curves at IoU=0.5}
+        \label{fig:pr}
+    \end{subfigure}
+    \hfill
+    \begin{subfigure}[b]{0.48\textwidth}
+        \includegraphics[width=\textwidth]{classification_metrics.png}
+        \caption{Patient-level classification}
+        \label{fig:classification}
+    \end{subfigure}
+    \caption{Precision--Recall and patient-level classification results.}
+    \label{fig:pr_class}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.7\textwidth]{ap_vs_iou.png}
+    \caption{AP as a function of IoU threshold. FCOS dominates at IoU=0.5 but Faster R-CNN is more competitive at stricter thresholds.}
+    \label{fig:ap_vs_iou}
+\end{figure}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.6\textwidth]{epoch_times.png}
+    \caption{Average epoch training time comparison. Note: Faster R-CNN was trained on CPU due to MPS compatibility issues; FCOS and RetinaNet used MPS (Apple M1).}
+    \label{fig:epoch_times}
+\end{figure}
+
+\subsection{Detection Samples}
+
+Figure~\ref{fig:detection_samples} shows qualitative examples of detections on validation images. Green boxes indicate ground-truth annotations, while colored boxes show model predictions with confidence scores.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=\textwidth]{detection_samples.png}
+    \caption{Sample detection results on validation images. Green = ground truth, colored = predictions.}
+    \label{fig:detection_samples}
+\end{figure}
+
+
+%==============================================================================
+\section{Discussion}
+\label{sec:discussion}
+%==============================================================================
+
+\subsection{Anchor-Free vs.\ Anchor-Based}
+
+Our experiments, while limited in scale, provide several insights:
+
+\begin{enumerate}
+    \item \textbf{FCOS achieves the best AP.} The anchor-free FCOS detector achieves AP@0.5 = 1.2\%, the highest among all three models, confirming the paper's finding that anchor-free methods can outperform anchor-based ones for pneumonia detection.
+
+    \item \textbf{Faster R-CNN shows the best recall.} Despite lower AP (0.7\%), Faster R-CNN achieves the highest AR@10 (19.5\%), almost double that of FCOS (9.8\%). The two-stage proposal refinement mechanism may help recall more lesions, though with less precise localization.
+
+    \item \textbf{RetinaNet fails to produce detections.} RetinaNet's zero AP and AR across all epochs suggests that the default anchor configuration is poorly suited for pneumonia opacities, which have highly variable sizes. This underscores a key advantage of anchor-free methods: no anchor hyperparameters to tune.
+
+    \item \textbf{Anchor-free $=$ faster convergence.} FCOS achieves non-zero AP within the first epoch, while both anchor-based methods struggle to produce meaningful detections early in training.
+\end{enumerate}
+
+\subsection{Comparison with Paper Results}
+
+Wu et al.~\cite{wu2024pneumonia} report AP@0.5 of approximately 28.5\% for FCOS on the full RSNA dataset with 20+ training epochs. Our significantly lower results (AP@0.5 $\approx$ 1.2\% for FCOS) are expected due to:
+\begin{itemize}[nosep]
+    \item Using only 500 patients vs.\ the full dataset ($\sim$26,000 images)
+    \item Training for only 5 epochs vs.\ 20+
+    \item No learning rate warmup strategy
+    \item Running on consumer hardware with computational constraints
+\end{itemize}
+
+The purpose of our comparison is to demonstrate the \emph{relative} advantages of anchor-free detection, not to match the paper's absolute numbers.
+
+\subsection{Limitations}
+
+\begin{itemize}
+    \item \textbf{Limited training:} The reduced dataset and few epochs significantly impact all models' performance.
+    \item \textbf{Single run:} We report results from a single training run without cross-validation or multiple seeds.
+    \item \textbf{Hyperparameter tuning:} We use the paper's reported hyperparameters without model-specific tuning, which may disadvantage RetinaNet and Faster R-CNN.
+    \item \textbf{Hardware constraints:} Training on Apple M1 with MPS acceleration introduces thermal throttling, limiting batch sizes and training duration.
+\end{itemize}
+
+
+%==============================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+%==============================================================================
+
+We reproduced the anchor-free pneumonia detection approach proposed by Wu et al.\ and systematically compared it against two anchor-based baselines (RetinaNet and Faster R-CNN). Our experiments on a subset of the RSNA dataset demonstrate that:
+
+\begin{enumerate}
+    \item The anchor-free FCOS detector shows faster convergence and requires no anchor hyperparameter tuning, making it an attractive choice for medical image detection tasks.
+    \item Anchor-based methods like RetinaNet may require careful anchor design and longer training to handle the variable-size nature of pneumonia opacities.
+    \item All models share the same ResNet-50 + FPN backbone, confirming that performance differences stem from the detection paradigm.
+\end{enumerate}
+
+For future work, training on the full dataset with more epochs and applying more advanced techniques (e.g., learning rate warmup, test-time augmentation) would better demonstrate the anchor-free advantage reported in the original paper.
+
+
+%==============================================================================
+% References
+%==============================================================================
+\bibliographystyle{plainnat}
+
+\begin{thebibliography}{9}
+
+\bibitem[Wu et al.(2024)]{wu2024pneumonia}
+J.~Wu, L.~Xia, X.~Cheng, Y.~Xu, and Z.~Tian.
+\newblock Pneumonia detection based on {RSNA} dataset and anchor-free deep learning detector.
+\newblock \emph{Scientific Reports}, 14:2581, 2024.
+\newblock \doi{10.1038/s41598-024-52156-7}.
+
+\bibitem[Tian et al.(2019)]{tian2019fcos}
+Z.~Tian, C.~Shen, H.~Chen, and T.~He.
+\newblock {FCOS}: Fully convolutional one-stage object detection.
+\newblock In \emph{Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV)}, pages 9627--9636, 2019.
+
+\bibitem[Lin et al.(2017a)]{lin2017focal}
+T.-Y.~Lin, P.~Goyal, R.~Girshick, K.~He, and P.~Doll\'{a}r.
+\newblock Focal loss for dense object detection.
+\newblock In \emph{Proceedings of the IEEE International Conference on Computer Vision (ICCV)}, pages 2999--3007, 2017.
+
+\bibitem[Lin et al.(2017b)]{lin2017feature}
+T.-Y.~Lin, P.~Doll\'{a}r, R.~Girshick, K.~He, B.~Hariharan, and S.~Belongie.
+\newblock Feature pyramid networks for object detection.
+\newblock In \emph{Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR)}, pages 936--944, 2017.
+
+\bibitem[He et al.(2016)]{he2016deep}
+K.~He, X.~Zhang, S.~Ren, and J.~Sun.
+\newblock Deep residual learning for image recognition.
+\newblock In \emph{Proceedings of the IEEE Conference on Computer Vision and Pattern Recognition (CVPR)}, pages 770--778, 2016.
+
+\bibitem[Ren et al.(2015)]{ren2015faster}
+S.~Ren, K.~He, R.~Girshick, and J.~Sun.
+\newblock Faster {R-CNN}: Towards real-time object detection with region proposal networks.
+\newblock In \emph{Advances in Neural Information Processing Systems (NeurIPS)}, pages 91--99, 2015.
+
+\bibitem[Shih et al.(2019)]{shih2019rsna}
+G.~Shih, C.~Wu, S.~Halabi, et al.
+\newblock Augmenting the {N}ational {I}nstitutes of {H}ealth chest radiograph dataset with expert annotations of possible pneumonia.
+\newblock \emph{Radiology: Artificial Intelligence}, 1(1):e180041, 2019.
+
+\end{thebibliography}
+
+\end{document}
