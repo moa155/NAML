@@ -226,8 +226,8 @@ def run_train(model_names: list, config: Config):
     import subprocess
 
     n_gpus = len(gpu_ids)
-    total_workers = config.effective_num_workers
-    workers_per_gpu = max(1, total_workers // n_gpus)
+    # Each subprocess is independent — give each the full worker count
+    workers_per_gpu = config.effective_num_workers
 
     print(f"\nGPU pool: {n_gpus} GPUs, {workers_per_gpu} workers/GPU")
     print(f"  Models queued: {[m.upper() for m in model_names]}")
