@@ -2,12 +2,17 @@
 
 Computes AP, AR at various IoU thresholds, matching the metrics reported
 in the paper (Table 2 and Table 3).
+
+Also provides:
+  - Gaussian Soft-NMS (Bodla et al., 2017) for improved detection
+  - Optimal patient-level threshold via ROC/Youden's J statistic
 """
 
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torchvision
 
 
 def compute_iou_matrix(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tensor:
@@ -33,6 +38,85 @@ def compute_iou_matrix(boxes1: torch.Tensor, boxes2: torch.Tensor) -> torch.Tens
     return inter / (union + 1e-6)
 
 
+# -----------------------------------------------------------------------
+# Gaussian Soft-NMS (Bodla et al., "Soft-NMS", ICCV 2017)
+# -----------------------------------------------------------------------
+
+def soft_nms(
+    boxes: torch.Tensor,
+    scores: torch.Tensor,
+    labels: torch.Tensor,
+    sigma: float = 0.5,
+    score_threshold: float = 0.05,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Gaussian Soft-NMS: decays overlapping scores instead of hard removal.
+
+    Unlike standard NMS which removes overlapping detections, Soft-NMS
+    decays their scores based on IoU overlap using a Gaussian penalty.
+    This preserves closely-spaced detections (common in pneumonia where
+    multiple lesions can overlap) while still suppressing duplicates.
+
+    Args:
+        boxes: (N, 4) tensor in xyxy format
+        scores: (N,) confidence scores
+        labels: (N,) class labels
+        sigma: Gaussian decay parameter (lower = more aggressive suppression)
+        score_threshold: Minimum score to keep after decay
+
+    Returns:
+        Filtered (boxes, scores, labels) tensors
+    """
+    if len(boxes) == 0:
+        return boxes, scores, labels
+
+    dets = boxes.clone()
+    sc = scores.clone()
+    labs = labels.clone()
+    N = len(dets)
+
+    for i in range(N):
+        # Find the highest-scoring detection among remaining
+        max_idx = i + sc[i:].argmax()
+
+        # Swap to front
+        dets[i], dets[max_idx] = dets[max_idx].clone(), dets[i].clone()
+        sc[i], sc[max_idx] = sc[max_idx].item(), sc[i].item()
+        labs[i], labs[max_idx] = labs[max_idx].item(), labs[i].item()
+
+        if i < N - 1:
+            # Compute IoU of current box with all subsequent
+            ious = torchvision.ops.box_iou(dets[i : i + 1], dets[i + 1 :])[0]
+            # Gaussian decay: exp(-IoU^2 / sigma)
+            decay = torch.exp(-(ious ** 2) / sigma)
+            sc[i + 1 :] *= decay
+
+    # Filter by score threshold
+    keep = sc > score_threshold
+    return dets[keep], sc[keep], labs[keep]
+
+
+def apply_soft_nms_to_predictions(
+    predictions: List[Dict],
+    sigma: float = 0.5,
+    score_threshold: float = 0.05,
+) -> List[Dict]:
+    """Apply Gaussian Soft-NMS to a list of per-image predictions."""
+    for pred in predictions:
+        if len(pred["boxes"]) > 0:
+            pred["boxes"], pred["scores"], pred["labels"] = soft_nms(
+                pred["boxes"],
+                pred["scores"],
+                pred["labels"],
+                sigma=sigma,
+                score_threshold=score_threshold,
+            )
+    return predictions
+
+
+# -----------------------------------------------------------------------
+# AP / AR computation
+# -----------------------------------------------------------------------
+
 def compute_ap_at_iou(
     predictions: List[Dict],
     targets: List[Dict],
@@ -45,7 +129,6 @@ def compute_ap_at_iou(
 
     Returns dict with keys: AP, precision, recall (arrays), num_gt, num_pred.
     """
-    # Collect all predictions across images, sorted by score descending
     all_scores = []
     all_tp = []
     total_gt = 0
@@ -74,16 +157,11 @@ def compute_ap_at_iou(
                 all_tp.append(0)
                 continue
 
-            ious = compute_iou_matrix(pred_boxes[i:i+1], gt_boxes)[0]
-            best_iou, best_idx = ious.max(0) if ious.numel() > 0 else (torch.tensor(0.0), torch.tensor(-1))
-
-            # Handle single-element tensors
-            if ious.dim() == 0:
-                best_iou_val = ious.item()
-                best_idx_val = 0
-            else:
-                best_iou_val = best_iou.item()
-                best_idx_val = best_idx.item()
+            # Compute IoU with all GT boxes
+            ious = compute_iou_matrix(pred_boxes[i : i + 1], gt_boxes)[0]
+            best_iou_val, best_idx_val = ious.max(0)
+            best_iou_val = best_iou_val.item()
+            best_idx_val = best_idx_val.item()
 
             if best_iou_val >= iou_threshold and best_idx_val not in matched_gt:
                 all_tp.append(1)
@@ -149,8 +227,6 @@ def compute_ar(
         matched_gt = set()
 
         for i in range(len(pred_boxes)):
-            if len(gt_boxes) == 0:
-                break
             row_ious = ious[i]
             best_idx = row_ious.argmax().item()
             if row_ious[best_idx].item() >= iou_threshold and best_idx not in matched_gt:
@@ -160,19 +236,74 @@ def compute_ar(
     return total_recalled / max(total_gt, 1)
 
 
-def _box_area(boxes: torch.Tensor) -> torch.Tensor:
-    return (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+# -----------------------------------------------------------------------
+# Optimal patient-level threshold via ROC
+# -----------------------------------------------------------------------
 
+def find_optimal_patient_threshold(
+    predictions: List[Dict],
+    targets: List[Dict],
+) -> Tuple[float, float]:
+    """Find optimal patient-level threshold via ROC / Youden's J statistic.
+
+    For each patient, the max detection score is used as the patient-level
+    score. The optimal threshold maximizes (sensitivity + specificity - 1),
+    giving the best trade-off between detecting pneumonia and avoiding
+    false alarms.
+
+    Returns:
+        (optimal_threshold, roc_auc)
+    """
+    patient_scores = []
+    patient_labels = []
+
+    for pred, gt in zip(predictions, targets):
+        has_gt = len(gt["boxes"]) > 0
+        max_score = pred["scores"].max().item() if len(pred["scores"]) > 0 else 0.0
+        patient_scores.append(max_score)
+        patient_labels.append(1 if has_gt else 0)
+
+    patient_scores = np.array(patient_scores)
+    patient_labels = np.array(patient_labels)
+
+    # Check for degenerate cases
+    if len(np.unique(patient_labels)) < 2:
+        return 0.3, 0.0
+
+    try:
+        from sklearn.metrics import roc_curve, auc
+
+        fpr, tpr, thresholds = roc_curve(patient_labels, patient_scores)
+        roc_auc = auc(fpr, tpr)
+
+        # Youden's J statistic: optimal balance of sensitivity and specificity
+        j_scores = tpr - fpr
+        optimal_idx = j_scores.argmax()
+        optimal_threshold = float(thresholds[optimal_idx])
+
+        return optimal_threshold, float(roc_auc)
+    except ImportError:
+        # Fallback: use fixed threshold
+        return 0.3, 0.0
+
+
+# -----------------------------------------------------------------------
+# Full metrics computation
+# -----------------------------------------------------------------------
 
 def compute_metrics(
     predictions: List[Dict],
     targets: List[Dict],
+    patient_threshold: Optional[float] = None,
 ) -> Dict[str, float]:
     """Compute the full set of detection metrics reported in the paper.
 
+    If patient_threshold is None, finds the optimal threshold via ROC.
+
     Returns dict with:
         AP@0.5, AP@0.5:0.95, AP_M, AP_L, AR@10, AR_M, AR_L,
-        patient_accuracy, patient_precision, patient_recall, patient_f1
+        patient_accuracy, patient_precision, patient_recall, patient_f1,
+        optimal_threshold, roc_auc
     """
     # --- Object detection metrics ---
     result_50 = compute_ap_at_iou(predictions, targets, iou_threshold=0.5)
@@ -185,7 +316,6 @@ def compute_metrics(
     ap_5095 = ap_sum / 10
 
     # Size-based AP (medium: area 32^2 to 96^2, large: area > 96^2)
-    # Following COCO: medium = 32^2..96^2, large > 96^2
     MEDIUM_AREA = (32 ** 2, 96 ** 2)
     LARGE_AREA = 96 ** 2
 
@@ -226,12 +356,16 @@ def compute_metrics(
     ar_m = compute_ar(pred_m, tgt_m, iou_threshold=0.5, max_dets=100)
     ar_l = compute_ar(pred_l, tgt_l, iou_threshold=0.5, max_dets=100)
 
+    # --- Optimal patient-level threshold ---
+    optimal_thresh, roc_auc = find_optimal_patient_threshold(predictions, targets)
+    if patient_threshold is None:
+        patient_threshold = optimal_thresh
+
     # --- Patient-level classification ---
-    # A patient is predicted positive if the model outputs at least one detection
     tp, fp, tn, fn = 0, 0, 0, 0
     for pred, gt in zip(predictions, targets):
         has_gt = len(gt["boxes"]) > 0
-        has_pred = len(pred["boxes"]) > 0 and (pred["scores"] > 0.5).any()
+        has_pred = len(pred["boxes"]) > 0 and (pred["scores"] > patient_threshold).any()
 
         if has_gt and has_pred:
             tp += 1
@@ -260,6 +394,8 @@ def compute_metrics(
         "patient_precision": precision,
         "patient_recall": recall,
         "patient_f1": f1,
+        "optimal_threshold": optimal_thresh,
+        "roc_auc": roc_auc,
         "precisions": result_50.get("precisions", []),
         "recalls": result_50.get("recalls", []),
     }

@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
-"""One-time script: evaluate all models and regenerate all plots with full data (including PR curves)."""
+"""One-time script: evaluate all models and regenerate all plots with full data (including PR curves).
 
+Usage:
+    python regenerate_plots.py                    # auto-detect device
+    python regenerate_plots.py --device cpu       # force CPU
+    python regenerate_plots.py --device cuda      # force CUDA
+    python regenerate_plots.py --device mps       # force MPS (Apple Silicon)
+"""
+
+import argparse
 import json
 import random
 from pathlib import Path
@@ -13,21 +21,29 @@ from src.config import Config
 from src.dataset import RSNAPneumoniaDataset, collate_fn, load_rsna_dataframes
 from src.transforms import get_val_transforms
 from src.models import build_model
-from src.engine import evaluate
+from src.engine import evaluate_model
 from src.evaluate import compute_metrics
 from src.visualize import generate_all_plots, plot_detection_samples
 
 MODELS = ["fcos", "retinanet", "faster_rcnn"]
 
 def main():
+    parser = argparse.ArgumentParser(description="Regenerate all plots from trained models")
+    parser.add_argument("--device", default=None, choices=["cpu", "cuda", "mps"],
+                        help="Force device (default: auto-detect)")
+    parser.add_argument("--max-samples", type=int, default=500,
+                        help="Number of patients to use (default: 500)")
+    args = parser.parse_args()
+
     config = Config(
         data_dir="data",
         output_dir="results",
         checkpoint_dir="checkpoints",
         num_workers=0,
-        max_samples=500,
-        force_device="cpu",
+        max_samples=args.max_samples,
+        force_device=args.device,
         seed=42,
+        patient_threshold=0.3,
     )
 
     # Seed
@@ -77,8 +93,11 @@ def main():
         model.load_state_dict(ckpt["model_state_dict"])
         model.to(config.device)
 
-        predictions, targets = evaluate(model, val_loader, config.device)
-        metrics = compute_metrics(predictions, targets)
+        predictions, targets = evaluate_model(
+            model, val_loader, config.device,
+            use_amp=False, use_tta=True, use_soft_nms=True,
+        )
+        metrics = compute_metrics(predictions, targets, patient_threshold=config.patient_threshold)
         all_metrics[name] = metrics
         all_predictions[name] = predictions
         if all_targets is None:
@@ -136,9 +155,6 @@ def main():
         targets=all_targets,
         images=sample_images,
     )
-
-    # Also generate detection samples
-    plot_detection_samples(sample_images, sample_targets, sample_preds_by_model, out_dir)
 
     print("\nAll plots regenerated with full data!")
 

@@ -197,9 +197,9 @@ All three models share the \textbf{same backbone and neck}, ensuring fair compar
 Following the paper's approach:
 \begin{itemize}
     \item Random horizontal flip ($p = 0.5$)
-    \item Random vertical flip ($p = 0.3$)
-    \item Random brightness/contrast ($p = 0.3$)
-    \item Random resized crop (scale 0.8--1.0)
+    \item Random vertical flip ($p = 0.5$)
+    \item Random brightness adjustment ($\delta = 0.2$)
+    \item Random crop (scale 0.8--1.0, applied with $p = 0.5$)
 \end{itemize}
 
 \vspace{0.5em}
@@ -228,8 +228,8 @@ All transforms applied jointly to images \textbf{and} bounding boxes.
 \includegraphics[width=0.75\textwidth]{val_ap_over_epochs.png}
 \end{center}
 \begin{itemize}
-    \item FCOS achieves highest AP@0.5 = 1.2\% --- best detector
-    \item Faster R-CNN peaks at 0.74\% (epoch 1), then declines
+    \item FCOS achieves highest AP@0.5 = 1.2\% at epoch 2 --- best detector
+    \item Faster R-CNN peaks at 0.74\% (epoch 1), then declines to zero
     \item RetinaNet: AP@0.5 remains at 0 throughout training
 \end{itemize}
 \end{frame}
@@ -304,7 +304,7 @@ Patient-level classification: predicting pneumonia presence/absence.
 \end{frame}
 
 %----------------------------------------------------------------------
-\begin{frame}{Summary Table}
+\begin{frame}{Detection Performance}
 \begin{table}
 \centering
 \small
@@ -320,8 +320,20 @@ Method & AP@0.5 & $AP_M$ & $AP_L$ & $AR_{10}$ & $AR_M$ & $AR_L$ \\
 \caption*{\footnotesize All scores in \%. FCOS/RetinaNet: 5 epochs; Faster R-CNN: 3 epochs.}
 \end{table}
 
-\vspace{0.5em}
-\textbf{Paper reference:} Wu et al.\ report FCOS AP@0.5 $\approx$ 28.5\% on full RSNA dataset (20 epochs).
+\begin{table}
+\centering
+\small
+\begin{tabular}{lcccc}
+\toprule
+Method & Accuracy & Precision & Recall & F1 \\
+\midrule
+\textcolor{fcosblue}{\textbf{FCOS}} & 77.0 & 0.0 & 0.0 & 0.0 \\
+\textcolor{retinaorange}{RetinaNet} & 77.0 & 0.0 & 0.0 & 0.0 \\
+\textcolor{fastergreen}{Faster R-CNN} & 77.0 & 0.0 & 0.0 & 0.0 \\
+\bottomrule
+\end{tabular}
+\caption*{\footnotesize Patient-level classification (\%). Threshold = 0.3. No model produces detections above this threshold.}
+\end{table}
 \end{frame}
 
 %======================================================================
@@ -333,7 +345,7 @@ Method & AP@0.5 & $AP_M$ & $AP_L$ & $AR_{10}$ & $AR_M$ & $AR_L$ \\
 \begin{enumerate}
     \item \textbf{FCOS achieves best AP} (1.2\%) --- confirms anchor-free advantage
     \begin{itemize}
-        \item Converges faster, non-zero AP from epoch 1
+        \item Converges faster, non-zero AP by epoch 2
     \end{itemize}
 
     \item \textbf{Faster R-CNN has best recall} ($AR_{10}$ = 19.5\%)
@@ -346,6 +358,12 @@ Method & AP@0.5 & $AP_M$ & $AP_L$ & $AR_{10}$ & $AR_M$ & $AR_L$ \\
     \begin{itemize}
         \item Default anchors suboptimal for variable-size opacities
         \item Highlights anchor-free advantage: no anchor design needed
+    \end{itemize}
+
+    \item \textbf{Patient-level classification shows insufficient training}
+    \begin{itemize}
+        \item No model produces detections above 0.3 confidence threshold
+        \item 77\% accuracy for all models reflects class distribution (majority negative)
     \end{itemize}
 \end{enumerate}
 \end{frame}

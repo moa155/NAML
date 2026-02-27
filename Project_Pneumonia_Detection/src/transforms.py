@@ -1,170 +1,209 @@
-"""Detection transforms implementing the paper's data augmentation strategy.
+"""Detection transforms with medical imaging augmentations.
 
-The paper uses:
-  1. Horizontal and vertical flips (applied randomly during training)
-  2. Luminance augmentation (random brightness changes)
-  3. Random cropping
+Augmentation pipeline optimized for chest X-ray pneumonia detection:
+  - CLAHE: Enhances local contrast in X-ray images (medical imaging standard)
+  - RandomBrightnessContrast: Simulates exposure/gain variation
+  - RandomGamma: Simulates display gamma differences
+  - HorizontalFlip: Anatomically valid (lungs are roughly symmetric)
+  - ShiftScaleRotate: Minor position/scale/rotation changes (patient positioning)
+  - GaussNoise/GaussianBlur: Simulates acquisition noise and defocus
+  - GridDistortion/ElasticTransform: Simulates anatomical variation
+  - CoarseDropout: Regularization via random occlusion
 
-All transforms preserve bounding-box consistency.
+No vertical flip — chest X-rays are always upright; flipping vertically is
+anatomically unrealistic and teaches the model incorrect patterns.
+
+Uses albumentations for robust bbox-consistent augmentation with automatic
+coordinate transformation for geometric augmentations.
 """
 
-import random
 from typing import Dict, Tuple
 
 import numpy as np
 import torch
-import torchvision.transforms.functional as F
-from PIL import Image
+
+try:
+    import albumentations as A
+    HAS_ALBUMENTATIONS = True
+except ImportError:
+    HAS_ALBUMENTATIONS = False
 
 
-# ---------------------------------------------------------------------------
-# Composable transform pair (image, target) -> (image, target)
-# ---------------------------------------------------------------------------
+class DetectionTransform:
+    """Wraps an albumentations pipeline for (image, target) -> (tensor, target).
 
-class Compose:
-    def __init__(self, transforms):
-        self.transforms = transforms
+    Handles conversion between the dataset's (numpy HWC float32, target dict)
+    format and albumentations' expected input (uint8 HWC + bbox list).
+    """
 
-    def __call__(self, image, target):
-        for t in self.transforms:
-            image, target = t(image, target)
-        return image, target
+    def __init__(self, album_transform):
+        self.transform = album_transform
 
-
-class ToTensor:
-    """Convert numpy HWC image to CHW float tensor."""
-
-    def __call__(self, image, target):
-        if isinstance(image, np.ndarray):
-            image = Image.fromarray((image * 255).astype(np.uint8))
-        image = F.to_tensor(image)  # CHW, float32 in [0,1]
-        return image, target
-
-
-class RandomHorizontalFlip:
-    def __init__(self, prob: float = 0.5):
-        self.prob = prob
-
-    def __call__(self, image, target):
-        if random.random() < self.prob:
-            if isinstance(image, torch.Tensor):
-                _, _, width = image.shape
-                image = image.flip(-1)
-            else:
-                height, width = image.shape[:2]
-                image = np.flip(image, axis=1).copy()
-
-            boxes = target["boxes"]
-            if len(boxes) > 0:
-                boxes[:, [0, 2]] = width - boxes[:, [2, 0]]
-                target["boxes"] = boxes
-        return image, target
-
-
-class RandomVerticalFlip:
-    def __init__(self, prob: float = 0.5):
-        self.prob = prob
-
-    def __call__(self, image, target):
-        if random.random() < self.prob:
-            if isinstance(image, torch.Tensor):
-                _, height, _ = image.shape
-                image = image.flip(-2)
-            else:
-                height = image.shape[0]
-                image = np.flip(image, axis=0).copy()
-
-            boxes = target["boxes"]
-            if len(boxes) > 0:
-                boxes[:, [1, 3]] = height - boxes[:, [3, 1]]
-                target["boxes"] = boxes
-        return image, target
-
-
-class RandomBrightness:
-    """Luminance augmentation as described in the paper."""
-
-    def __init__(self, delta: float = 0.2):
-        self.delta = delta
-
-    def __call__(self, image, target):
-        if isinstance(image, np.ndarray):
-            factor = 1.0 + random.uniform(-self.delta, self.delta)
-            image = np.clip(image * factor, 0.0, 1.0)
-        elif isinstance(image, torch.Tensor):
-            factor = 1.0 + random.uniform(-self.delta, self.delta)
-            image = torch.clamp(image * factor, 0.0, 1.0)
-        return image, target
-
-
-class RandomCrop:
-    """Random crop that preserves bounding boxes (keeps boxes with sufficient overlap)."""
-
-    def __init__(self, min_scale: float = 0.8, max_scale: float = 1.0):
-        self.min_scale = min_scale
-        self.max_scale = max_scale
-
-    def __call__(self, image, target):
-        if random.random() < 0.5:
-            return image, target  # apply 50% of the time
-
-        if isinstance(image, torch.Tensor):
-            _, h, w = image.shape
+    def __call__(self, image: np.ndarray, target: Dict) -> Tuple[torch.Tensor, Dict]:
+        # Convert float32 [0,1] -> uint8 [0,255] for albumentations
+        if image.dtype in (np.float32, np.float64):
+            image_uint8 = np.clip(image * 255, 0, 255).astype(np.uint8)
         else:
-            h, w = image.shape[:2]
+            image_uint8 = image
 
-        scale = random.uniform(self.min_scale, self.max_scale)
-        new_h, new_w = int(h * scale), int(w * scale)
-        top = random.randint(0, h - new_h)
-        left = random.randint(0, w - new_w)
+        # Extract boxes and labels for albumentations
+        boxes = target["boxes"].numpy().tolist() if len(target["boxes"]) > 0 else []
+        labels = target["labels"].numpy().tolist() if len(target["labels"]) > 0 else []
 
-        # Crop image
-        if isinstance(image, torch.Tensor):
-            image = image[:, top : top + new_h, left : left + new_w]
+        # Apply augmentation pipeline
+        result = self.transform(image=image_uint8, bboxes=boxes, labels=labels)
+
+        # Convert uint8 HWC -> float32 CHW tensor (avoids quantization round-trip)
+        img_np = result["image"]
+        img_tensor = torch.from_numpy(img_np.transpose(2, 0, 1).copy()).float().div_(255.0)
+
+        # Reconstruct target from augmented bboxes
+        out_boxes = result["bboxes"]
+        out_labels = result["labels"]
+
+        if len(out_boxes) > 0:
+            boxes_t = torch.tensor(out_boxes, dtype=torch.float32)
+            labels_t = torch.tensor(out_labels, dtype=torch.int64)
+            areas = (boxes_t[:, 2] - boxes_t[:, 0]) * (boxes_t[:, 3] - boxes_t[:, 1])
+            target = {
+                "boxes": boxes_t,
+                "labels": labels_t,
+                "image_id": target["image_id"],
+                "area": areas,
+                "iscrowd": torch.zeros(len(out_boxes), dtype=torch.int64),
+            }
         else:
-            image = image[top : top + new_h, left : left + new_w].copy()
+            target = {
+                "boxes": torch.zeros((0, 4), dtype=torch.float32),
+                "labels": torch.zeros(0, dtype=torch.int64),
+                "image_id": target["image_id"],
+                "area": torch.zeros(0, dtype=torch.float32),
+                "iscrowd": torch.zeros(0, dtype=torch.int64),
+            }
 
-        boxes = target["boxes"]
-        if len(boxes) > 0:
-            # Shift boxes
-            boxes[:, 0] -= left
-            boxes[:, 1] -= top
-            boxes[:, 2] -= left
-            boxes[:, 3] -= top
-
-            # Clip to crop bounds
-            boxes[:, 0] = boxes[:, 0].clamp(min=0, max=new_w)
-            boxes[:, 1] = boxes[:, 1].clamp(min=0, max=new_h)
-            boxes[:, 2] = boxes[:, 2].clamp(min=0, max=new_w)
-            boxes[:, 3] = boxes[:, 3].clamp(min=0, max=new_h)
-
-            # Remove degenerate boxes
-            keep = (boxes[:, 2] - boxes[:, 0] > 2) & (boxes[:, 3] - boxes[:, 1] > 2)
-            target["boxes"] = boxes[keep]
-            target["labels"] = target["labels"][keep]
-            target["area"] = target["area"][keep] if "area" in target else None
-            target["iscrowd"] = target["iscrowd"][keep]
-
-        return image, target
+        return img_tensor, target
 
 
-# ---------------------------------------------------------------------------
-# Pre-built transform pipelines
-# ---------------------------------------------------------------------------
+class _FallbackToTensor:
+    """Fallback transform when albumentations is not available."""
 
-def get_train_transforms(use_augmentation: bool = True) -> Compose:
-    """Training transforms following the paper's augmentation strategy."""
-    transforms = [ToTensor()]
+    def __call__(self, image: np.ndarray, target: Dict) -> Tuple[torch.Tensor, Dict]:
+        if image.dtype in (np.float32, np.float64):
+            img_tensor = torch.from_numpy(image.transpose(2, 0, 1).copy()).float()
+        else:
+            img_tensor = torch.from_numpy(
+                image.transpose(2, 0, 1).copy()
+            ).float().div_(255.0)
+        return img_tensor, target
+
+
+def _build_train_pipeline():
+    """Build albumentations training pipeline for chest X-ray detection."""
+    transforms = []
+
+    # --- Medical imaging specific ---
+    transforms.append(
+        A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=0.3)
+    )
+
+    # --- Photometric augmentations ---
+    transforms.append(
+        A.RandomBrightnessContrast(
+            brightness_limit=0.2, contrast_limit=0.2, p=0.4
+        )
+    )
+    transforms.append(
+        A.RandomGamma(gamma_limit=(80, 120), p=0.2)
+    )
+
+    # --- Geometric augmentations ---
+    transforms.append(A.HorizontalFlip(p=0.5))
+    transforms.append(
+        A.ShiftScaleRotate(
+            shift_limit=0.05,
+            scale_limit=0.1,
+            rotate_limit=10,
+            border_mode=0,  # cv2.BORDER_CONSTANT
+            value=0,
+            p=0.3,
+        )
+    )
+
+    # --- Noise and blur ---
+    transforms.append(
+        A.OneOf(
+            [
+                A.GaussianBlur(blur_limit=(3, 5), p=1.0),
+                A.GaussNoise(p=1.0),
+            ],
+            p=0.2,
+        )
+    )
+
+    # --- Elastic/grid distortion (simulates anatomical variation) ---
+    transforms.append(
+        A.OneOf(
+            [
+                A.GridDistortion(num_steps=5, distort_limit=0.1, p=1.0),
+                A.OpticalDistortion(distort_limit=0.1, shift_limit=0.05, p=1.0),
+            ],
+            p=0.15,
+        )
+    )
+
+    # --- Regularization (random occlusion) ---
+    transforms.append(
+        A.CoarseDropout(
+            max_holes=4,
+            max_height=32,
+            max_width=32,
+            fill_value=0,
+            p=0.15,
+        )
+    )
+
+    return A.Compose(
+        transforms,
+        bbox_params=A.BboxParams(
+            format="pascal_voc",
+            label_fields=["labels"],
+            min_area=100,         # Drop boxes smaller than 10x10 pixels
+            min_visibility=0.3,   # Drop boxes less than 30% visible after crop
+        ),
+    )
+
+
+def _build_val_pipeline():
+    """Build albumentations validation pipeline (no augmentation)."""
+    return A.Compose(
+        [],
+        bbox_params=A.BboxParams(
+            format="pascal_voc",
+            label_fields=["labels"],
+        ),
+    )
+
+
+def get_train_transforms(use_augmentation: bool = True) -> DetectionTransform:
+    """Training transforms with medical imaging augmentations.
+
+    Uses albumentations for CLAHE, rotation, contrast, noise, elastic
+    distortion — all critical for chest X-ray detection performance.
+    Falls back to simple tensor conversion if albumentations unavailable.
+    """
+    if not HAS_ALBUMENTATIONS:
+        return _FallbackToTensor()
+
     if use_augmentation:
-        transforms += [
-            RandomHorizontalFlip(prob=0.5),
-            RandomVerticalFlip(prob=0.5),
-            RandomBrightness(delta=0.2),
-            RandomCrop(min_scale=0.8, max_scale=1.0),
-        ]
-    return Compose(transforms)
+        pipeline = _build_train_pipeline()
+    else:
+        pipeline = _build_val_pipeline()
+
+    return DetectionTransform(pipeline)
 
 
-def get_val_transforms() -> Compose:
+def get_val_transforms() -> DetectionTransform:
     """Validation/test transforms (no augmentation)."""
-    return Compose([ToTensor()])
+    if not HAS_ALBUMENTATIONS:
+        return _FallbackToTensor()
+    return DetectionTransform(_build_val_pipeline())

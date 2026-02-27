@@ -221,11 +221,18 @@ def plot_val_ap_over_epochs(histories: Dict[str, Dict], output_dir: Path):
     fig, ax = plt.subplots(figsize=(10, 6))
 
     for name, hist in histories.items():
-        aps = [m.get("AP@0.5", 0) * 100 for m in hist.get("val_metrics", [])]
+        val_metrics = hist.get("val_metrics", [])
+        # Filter out None entries (skipped validation epochs)
+        epochs_with_val = []
+        aps = []
+        for i, m in enumerate(val_metrics):
+            if m is not None:
+                epochs_with_val.append(i + 1)
+                aps.append(m.get("AP@0.5", 0) * 100)
         if aps:
-            ax.plot(range(1, len(aps) + 1), aps,
+            ax.plot(epochs_with_val, aps,
                     label=MODEL_LABELS.get(name, name),
-                    color=MODEL_COLORS.get(name, None), linewidth=2)
+                    color=MODEL_COLORS.get(name, None), linewidth=2, marker="o", markersize=4)
 
     ax.set_xlabel("Epoch")
     ax.set_ylabel("AP@0.5 (%)")
@@ -288,9 +295,12 @@ def plot_detection_samples(
     n_cols = 1 + n_models  # GT + each model
     n_rows = min(num_samples, len(images))
 
+    if n_rows == 0:
+        return
+
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 5 * n_rows))
-    if n_rows == 1:
-        axes = axes[np.newaxis, :]
+    # Ensure axes is always 2D
+    axes = np.atleast_2d(axes)
 
     for row in range(n_rows):
         img = images[row]
@@ -358,9 +368,6 @@ def plot_epoch_times(histories: Dict[str, Dict], output_dir: Path):
 
     ax.set_ylabel("Average Epoch Time (s)")
     ax.set_title("Training Speed Comparison")
-    ax.annotate("* Faster R-CNN trained on CPU; others on MPS (Apple M1)",
-                xy=(0.5, -0.08), xycoords="axes fraction",
-                ha="center", fontsize=9, fontstyle="italic", color="gray")
     _save(fig, output_dir / "epoch_times.png", close=False)
     _save(fig, output_dir / "epoch_times.pdf")
 

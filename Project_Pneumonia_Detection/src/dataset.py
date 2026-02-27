@@ -12,7 +12,6 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
-from PIL import Image
 
 
 class RSNAPneumoniaDataset(Dataset):
@@ -37,44 +36,62 @@ class RSNAPneumoniaDataset(Dataset):
         # Determine image format: prefer PNG over DICOM
         image_dir = Path(image_dir)
         png_dir = image_dir.parent / "stage_2_train_images_png"
-        if png_dir.exists() and len(list(png_dir.glob("*.png"))) > 0:
+        if png_dir.exists() and any(png_dir.iterdir()):
             self.image_dir = png_dir
             self.use_png = True
         else:
             self.image_dir = image_dir
             self.use_png = False
 
-        # Group bounding boxes by patient ID
+        # Group bounding boxes by patient ID using groupby (O(N) instead of O(N*M))
         self.patient_ids = annotations_df["patientId"].unique().tolist()
 
         self.annotations: Dict[str, List[List[float]]] = {}
-        for pid in self.patient_ids:
-            rows = annotations_df[annotations_df["patientId"] == pid]
+        grouped = annotations_df.groupby("patientId")
+        for pid, group in grouped:
             boxes = []
-            for _, row in rows.iterrows():
+            for _, row in group.iterrows():
                 if row["Target"] == 1 and not np.isnan(row["x"]):
                     x, y, w, h = row["x"], row["y"], row["width"], row["height"]
                     boxes.append([x, y, x + w, y + h])  # xyxy format
             self.annotations[pid] = boxes
 
+        # Ensure all patient_ids have an entry (some may not be in grouped)
+        for pid in self.patient_ids:
+            if pid not in self.annotations:
+                self.annotations[pid] = []
+
     def __len__(self) -> int:
         return len(self.patient_ids)
 
+    def get_positive_mask(self) -> List[bool]:
+        """Return boolean list: True for patients with pneumonia boxes.
+
+        Used by WeightedRandomSampler to oversample positive patients.
+        """
+        return [len(self.annotations[pid]) > 0 for pid in self.patient_ids]
+
     def _load_image(self, patient_id: str) -> np.ndarray:
         """Load image and return as float32 HWC array in [0, 1]."""
-        if self.use_png:
-            path = self.image_dir / f"{patient_id}.png"
-            img = np.array(Image.open(path), dtype=np.float32) / 255.0
-        else:
-            import pydicom
-            path = self.image_dir / f"{patient_id}.dcm"
-            dcm = pydicom.dcmread(str(path))
-            img = dcm.pixel_array.astype(np.float32)
-            pmin, pmax = img.min(), img.max()
-            if pmax - pmin > 0:
-                img = (img - pmin) / (pmax - pmin)
+        try:
+            if self.use_png:
+                path = self.image_dir / f"{patient_id}.png"
+                from PIL import Image
+                img = np.array(Image.open(path), dtype=np.float32) / 255.0
             else:
-                img = np.zeros_like(img)
+                import pydicom
+                path = self.image_dir / f"{patient_id}.dcm"
+                dcm = pydicom.dcmread(str(path))
+                img = dcm.pixel_array.astype(np.float32)
+                pmin, pmax = img.min(), img.max()
+                if pmax - pmin > 0:
+                    img = (img - pmin) / (pmax - pmin)
+                else:
+                    img = np.zeros_like(img)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Image not found: {self.image_dir / patient_id}.*")
+        except Exception as e:
+            raise RuntimeError(f"Failed to load image for patient {patient_id}: {e}")
 
         # Single-channel -> 3-channel
         if img.ndim == 2:
