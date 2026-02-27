@@ -222,20 +222,53 @@ def run_train(model_names: list, config: Config):
                 torch.cuda.empty_cache()
         return histories
 
-    # --- Multi-GPU: pool-based scheduling (no idle GPUs) ---
-    import torch.multiprocessing as mp
-    mp.set_start_method("spawn", force=True)
+    # --- Multi-GPU: subprocess-based scheduling with per-model log files ---
+    import subprocess
 
     n_gpus = len(gpu_ids)
     total_workers = config.effective_num_workers
     workers_per_gpu = max(1, total_workers // n_gpus)
-    adjusted_config = replace(config, num_workers=workers_per_gpu)
 
     print(f"\nGPU pool: {n_gpus} GPUs, {workers_per_gpu} workers/GPU")
     print(f"  Models queued: {[m.upper() for m in model_names]}")
 
-    pending = list(model_names)       # models waiting to start
-    running = {}                       # gpu_id -> (model_name, process)
+    # Build CLI args from config
+    cli_args = (
+        f" --data-dir {config.data_dir}"
+        f" --output-dir {config.output_dir}"
+        f" --checkpoint-dir {config.checkpoint_dir}"
+        f" --epochs {config.num_epochs}"
+        f" --batch-size {config.batch_size}"
+        f" --lr {config.learning_rate}"
+        f" --image-size {config.image_min_size}"
+        f" --seed {config.seed}"
+        f" --val-frequency {getattr(config, 'val_frequency', 2)}"
+        f" --early-stopping {getattr(config, 'early_stopping_patience', 5)}"
+        f" --prefetch-factor {getattr(config, 'prefetch_factor', 4)}"
+        f" --freeze-epochs {getattr(config, 'freeze_backbone_epochs', 3)}"
+        f" --scheduler {getattr(config, 'scheduler_type', 'cosine')}"
+        f" --grad-accum {getattr(config, 'gradient_accumulation', 1)}"
+        f" --patient-threshold {config.patient_threshold}"
+    )
+    if not config.use_amp:
+        cli_args += " --no-amp"
+    if not getattr(config, 'use_ema', True):
+        cli_args += " --no-ema"
+    if not getattr(config, 'use_tta', True):
+        cli_args += " --no-tta"
+    if not getattr(config, 'use_soft_nms', True):
+        cli_args += " --no-soft-nms"
+    if not getattr(config, 'use_weighted_sampler', True):
+        cli_args += " --no-weighted-sampler"
+    if getattr(config, 'multi_scale', False):
+        cli_args += " --multi-scale"
+    if getattr(config, 'resume', False):
+        cli_args += " --resume"
+    if config.max_samples is not None:
+        cli_args += f" --max-samples {config.max_samples}"
+
+    pending = list(model_names)
+    running = {}   # gpu_id -> (model_name, process, log_fh, log_path)
     histories = {}
 
     while pending or running:
@@ -244,32 +277,64 @@ def run_train(model_names: list, config: Config):
         while pending and free_gpus:
             gpu_id = free_gpus.pop(0)
             name = pending.pop(0)
-            print(f"\n{'='*60}")
-            print(f"  Starting: {name.upper()} on GPU {gpu_id}")
-            print(f"  Queue remaining: {[m.upper() for m in pending]}")
-            print(f"{'='*60}")
-            p = mp.Process(target=_train_on_gpu, args=(name, gpu_id, adjusted_config))
-            p.start()
-            running[gpu_id] = (name, p)
+            log_path = Path(config.output_dir) / f"train_{name}.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_fh = open(log_path, "w")
+            cmd = (
+                f"python main.py --mode train --model {name}"
+                f" --device cuda:{gpu_id} --num-workers {workers_per_gpu}"
+                f" {cli_args}"
+            )
+            env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+            proc = subprocess.Popen(cmd, shell=True, stdout=log_fh, stderr=subprocess.STDOUT, env=env)
+            running[gpu_id] = (name, proc, log_fh, log_path)
+            print(f"\n  Started {name.upper()} on GPU {gpu_id}  (queue: {[m.upper() for m in pending]})")
 
         if not running:
             break
 
-        # Poll running processes (check every 5 seconds)
-        import time as _time
-        _time.sleep(5)
+        # Poll every 30 seconds and show clean status
+        time.sleep(30)
 
+        # Show latest epoch summary from each model's log
         for gpu_id in list(running.keys()):
-            name, p = running[gpu_id]
-            if not p.is_alive():
-                p.join()
-                del running[gpu_id]
-                if p.exitcode == 0:
-                    print(f"\n  {name.upper()} completed on GPU {gpu_id}")
-                else:
-                    print(f"\n  WARNING: {name.upper()} exited with code {p.exitcode} on GPU {gpu_id}")
+            name, proc, log_fh, log_path = running[gpu_id]
+            rc = proc.poll()
 
-                # Load history from saved JSON
+            # Find latest epoch summary line
+            try:
+                with open(log_path) as f:
+                    lines = f.readlines()
+                for line in reversed(lines):
+                    stripped = line.strip()
+                    if f"[{name}]" in stripped and "Epoch" in stripped:
+                        print(f"  GPU {gpu_id}: {stripped}")
+                        break
+                else:
+                    # No epoch line yet, show last non-empty line
+                    for line in reversed(lines):
+                        stripped = line.strip()
+                        if stripped and not stripped.startswith(("W0", "Traceback", "  File")):
+                            print(f"  GPU {gpu_id} [{name}]: {stripped[:80]}")
+                            break
+            except FileNotFoundError:
+                pass
+
+            if rc is not None:
+                log_fh.close()
+                del running[gpu_id]
+                status = "DONE" if rc == 0 else f"FAILED (exit {rc})"
+                print(f"\n{'='*60}")
+                print(f"  {name.upper()} — {status} (GPU {gpu_id} free)")
+                print(f"{'='*60}")
+                # Print last 10 lines of log
+                try:
+                    with open(log_path) as f:
+                        for line in f.readlines()[-10:]:
+                            print(f"    {line.rstrip()}")
+                except FileNotFoundError:
+                    pass
+
                 hist_path = Path(config.output_dir) / f"{name}_history.json"
                 if hist_path.exists():
                     with open(hist_path) as f:
