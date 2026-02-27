@@ -25,8 +25,10 @@ import torch
 try:
     import albumentations as A
     HAS_ALBUMENTATIONS = True
+    _ALBU_V2 = int(A.__version__.split(".")[0]) >= 2
 except ImportError:
     HAS_ALBUMENTATIONS = False
+    _ALBU_V2 = False
 
 
 class DetectionTransform:
@@ -118,16 +120,28 @@ def _build_train_pipeline():
 
     # --- Geometric augmentations ---
     transforms.append(A.HorizontalFlip(p=0.5))
-    transforms.append(
-        A.ShiftScaleRotate(
-            shift_limit=0.05,
-            scale_limit=0.1,
-            rotate_limit=10,
-            border_mode=0,  # cv2.BORDER_CONSTANT
-            value=0,
-            p=0.3,
+    if _ALBU_V2:
+        transforms.append(
+            A.Affine(
+                translate_percent={"x": (-0.05, 0.05), "y": (-0.05, 0.05)},
+                scale=(0.9, 1.1),
+                rotate=(-10, 10),
+                mode=0,  # cv2.BORDER_CONSTANT
+                fill=0,
+                p=0.3,
+            )
         )
-    )
+    else:
+        transforms.append(
+            A.ShiftScaleRotate(
+                shift_limit=0.05,
+                scale_limit=0.1,
+                rotate_limit=10,
+                border_mode=0,  # cv2.BORDER_CONSTANT
+                value=0,
+                p=0.3,
+            )
+        )
 
     # --- Noise and blur ---
     transforms.append(
@@ -141,26 +155,48 @@ def _build_train_pipeline():
     )
 
     # --- Elastic/grid distortion (simulates anatomical variation) ---
-    transforms.append(
-        A.OneOf(
-            [
-                A.GridDistortion(num_steps=5, distort_limit=0.1, p=1.0),
-                A.OpticalDistortion(distort_limit=0.1, shift_limit=0.05, p=1.0),
-            ],
-            p=0.15,
+    if _ALBU_V2:
+        transforms.append(
+            A.OneOf(
+                [
+                    A.GridDistortion(num_steps=5, distort_limit=0.1, p=1.0),
+                    A.OpticalDistortion(distort_limit=0.1, p=1.0),
+                ],
+                p=0.15,
+            )
         )
-    )
+    else:
+        transforms.append(
+            A.OneOf(
+                [
+                    A.GridDistortion(num_steps=5, distort_limit=0.1, p=1.0),
+                    A.OpticalDistortion(distort_limit=0.1, shift_limit=0.05, p=1.0),
+                ],
+                p=0.15,
+            )
+        )
 
     # --- Regularization (random occlusion) ---
-    transforms.append(
-        A.CoarseDropout(
-            max_holes=4,
-            max_height=32,
-            max_width=32,
-            fill_value=0,
-            p=0.15,
+    if _ALBU_V2:
+        transforms.append(
+            A.CoarseDropout(
+                num_holes_range=(1, 4),
+                hole_height_range=(16, 32),
+                hole_width_range=(16, 32),
+                fill=0,
+                p=0.15,
+            )
         )
-    )
+    else:
+        transforms.append(
+            A.CoarseDropout(
+                max_holes=4,
+                max_height=32,
+                max_width=32,
+                fill_value=0,
+                p=0.15,
+            )
+        )
 
     return A.Compose(
         transforms,
