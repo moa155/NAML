@@ -172,12 +172,13 @@ def train_one_epoch(
     gradient_accumulation: int = 1,
     multi_scale: bool = False,
     ema: Optional["ModelEMA"] = None,
+    amp_dtype: Optional[torch.dtype] = None,
 ) -> Dict[str, float]:
     """Train for one epoch, returning average losses."""
     model.train()
     running_losses = {}
     num_batches = 0
-    use_amp = scaler is not None and device.type == "cuda"
+    use_amp = amp_dtype is not None and device.type == "cuda"
     accum_steps = max(1, gradient_accumulation)
 
     # Multi-scale training: random resize per batch
@@ -214,7 +215,7 @@ def train_one_epoch(
             model.transform.max_size = scale
 
         # Forward pass with optional mixed precision
-        with torch.amp.autocast(device.type, enabled=use_amp):
+        with torch.amp.autocast(device.type, enabled=use_amp, dtype=amp_dtype):
             loss_dict = model(images, targets)
             losses = sum(loss for loss in loss_dict.values())
             # Scale loss for gradient accumulation
@@ -225,14 +226,14 @@ def train_one_epoch(
             optimizer.zero_grad(set_to_none=True)
             continue
 
-        if use_amp:
+        if scaler is not None:
             scaler.scale(losses).backward()
         else:
             losses.backward()
 
         # Optimizer step every accum_steps
         if (batch_idx + 1) % accum_steps == 0 or (batch_idx + 1) == len(data_loader):
-            if use_amp:
+            if scaler is not None:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 scaler.step(optimizer)
@@ -277,6 +278,7 @@ def evaluate(
     data_loader: DataLoader,
     device: torch.device,
     use_amp: bool = False,
+    amp_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[List[Dict], List[Dict]]:
     """Run inference and collect predictions + ground truth.
 
@@ -289,12 +291,12 @@ def evaluate(
     model.eval()
     all_predictions = []
     all_targets = []
-    amp_enabled = use_amp and device.type == "cuda"
+    amp_enabled = amp_dtype is not None and device.type == "cuda"
 
     for images, targets in tqdm(data_loader, desc="Evaluating", file=sys.stdout):
         images = [img.to(device, non_blocking=True) for img in images]
 
-        with torch.amp.autocast(device.type, enabled=amp_enabled):
+        with torch.amp.autocast(device.type, enabled=amp_enabled, dtype=amp_dtype):
             outputs = model(images)
 
         for output, target in zip(outputs, targets):
@@ -326,6 +328,7 @@ def evaluate_with_tta(
     data_loader: DataLoader,
     device: torch.device,
     use_amp: bool = False,
+    amp_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[List[Dict], List[Dict]]:
     """Evaluate with Test-Time Augmentation (horizontal flip).
 
@@ -336,18 +339,18 @@ def evaluate_with_tta(
     model.eval()
     all_predictions = []
     all_targets = []
-    amp_enabled = use_amp and device.type == "cuda"
+    amp_enabled = amp_dtype is not None and device.type == "cuda"
 
     for images, targets in tqdm(data_loader, desc="Evaluating (TTA)", file=sys.stdout):
         images_device = [img.to(device, non_blocking=True) for img in images]
 
         # Original predictions
-        with torch.amp.autocast(device.type, enabled=amp_enabled):
+        with torch.amp.autocast(device.type, enabled=amp_enabled, dtype=amp_dtype):
             orig_outputs = model(images_device)
 
         # Flipped predictions
         flipped_images = [img.flip(-1) for img in images_device]
-        with torch.amp.autocast(device.type, enabled=amp_enabled):
+        with torch.amp.autocast(device.type, enabled=amp_enabled, dtype=amp_dtype):
             flip_outputs = model(flipped_images)
 
         for orig_out, flip_out, img, target in zip(
@@ -416,6 +419,7 @@ def evaluate_model(
     use_amp: bool = False,
     use_tta: bool = False,
     use_soft_nms: bool = False,
+    amp_dtype: Optional[torch.dtype] = None,
 ) -> Tuple[List[Dict], List[Dict]]:
     """Evaluate with optional TTA and Soft-NMS.
 
@@ -429,9 +433,9 @@ def evaluate_model(
 
     # Run evaluation (with or without TTA)
     if use_tta:
-        predictions, targets = evaluate_with_tta(model, data_loader, device, use_amp)
+        predictions, targets = evaluate_with_tta(model, data_loader, device, use_amp, amp_dtype=amp_dtype)
     else:
-        predictions, targets = evaluate(model, data_loader, device, use_amp)
+        predictions, targets = evaluate(model, data_loader, device, use_amp, amp_dtype=amp_dtype)
 
     # Apply Soft-NMS post-processing
     if use_soft_nms:
@@ -540,11 +544,21 @@ def train_model(
     if hasattr(config, "num_threads") and config.num_threads > 0:
         torch.set_num_threads(config.num_threads)
 
-    # Mixed precision scaler (CUDA only)
+    # Mixed precision: choose dtype and scaler
     use_amp = hasattr(config, "use_amp") and config.use_amp and device.type == "cuda"
-    scaler = torch.amp.GradScaler(device.type) if use_amp else None
+    use_bf16 = getattr(config, "use_bf16", False) and device.type == "cuda"
+    amp_dtype: Optional[torch.dtype] = None
+    scaler = None
+
     if use_amp:
-        print(f"  Using Automatic Mixed Precision (AMP) on {device}")
+        if use_bf16:
+            # BFloat16: no loss scaling needed, requires Ampere+ (sm_80)
+            amp_dtype = torch.bfloat16
+            print(f"  Using BFloat16 AMP on {device} (no GradScaler)")
+        else:
+            amp_dtype = torch.float16
+            scaler = torch.amp.GradScaler(device.type)
+            print(f"  Using Float16 AMP on {device}")
 
     # torch.compile() for PyTorch 2.x speedup
     use_compile = getattr(config, "use_compile", False)
@@ -560,8 +574,10 @@ def train_model(
 
     # --- Optimizer: Adam with only trainable parameters ---
     params = [p for p in model.parameters() if p.requires_grad]
+    fused = device.type == "cuda"  # fused Adam: ~10-15% faster optimizer step
     optimizer = torch.optim.Adam(
-        params, lr=config.learning_rate, weight_decay=config.weight_decay
+        params, lr=config.learning_rate, weight_decay=config.weight_decay,
+        fused=fused,
     )
 
     # --- LR Schedule ---
@@ -667,6 +683,7 @@ def train_model(
                     {"params": other_params, "lr": config.learning_rate},
                 ],
                 weight_decay=config.weight_decay,
+                fused=fused,
             )
             # Rebuild scheduler for remaining epochs
             remaining = config.num_epochs - epoch + 1
@@ -690,6 +707,7 @@ def train_model(
             gradient_accumulation=grad_accum,
             multi_scale=multi_scale,
             ema=ema,
+            amp_dtype=amp_dtype,
         )
         history["train_losses"].append(avg_losses)
         history["learning_rates"].append(optimizer.param_groups[0]["lr"])
@@ -707,6 +725,7 @@ def train_model(
             # TTA and Soft-NMS are only used at final evaluation time.
             predictions, targets = evaluate(
                 model, val_loader, device, use_amp=use_amp,
+                amp_dtype=amp_dtype,
             )
 
             from src.evaluate import compute_metrics

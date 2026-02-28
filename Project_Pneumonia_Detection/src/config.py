@@ -29,7 +29,7 @@ class Config:
     batch_size: int = 4
     num_workers: int = -1  # -1 = auto-detect based on CPU cores
     num_epochs: int = 20
-    learning_rate: float = 1e-4
+    learning_rate: float = 1e-3  # paper uses SGD with lr=0.001
     lr_milestones: tuple = (12, 16)
     lr_gamma: float = 0.1
     weight_decay: float = 1e-4
@@ -52,6 +52,7 @@ class Config:
     # --- Performance ---
     force_device: Optional[str] = None  # None = auto-detect, "cpu", "cuda", "mps"
     use_amp: bool = True  # Automatic Mixed Precision (CUDA only)
+    use_bf16: bool = False  # Use BFloat16 instead of Float16 (Ampere+ GPUs)
     num_threads: int = 0  # OpenMP threads (0 = auto)
     use_compile: bool = True  # torch.compile() for 20-40% speedup (PyTorch 2.x)
     prefetch_factor: int = 4  # DataLoader prefetch (batches per worker)
@@ -65,7 +66,7 @@ class Config:
     freeze_backbone_epochs: int = 3  # Freeze early ResNet layers for N epochs (0=disabled)
     use_ema: bool = True  # Exponential Moving Average of model weights
     ema_decay: float = 0.999  # EMA decay factor
-    scheduler_type: str = "cosine"  # "cosine" or "step"
+    scheduler_type: str = "cosine"  # "cosine" or "step" (paper uses step decay)
     gradient_accumulation: int = 1  # Effective batch = batch_size * accumulation
     multi_scale: bool = False  # Random multi-scale training [448..576]
 

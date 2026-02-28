@@ -252,6 +252,8 @@ def run_train(model_names: list, config: Config):
     )
     if not config.use_amp:
         cli_args += " --no-amp"
+    if getattr(config, 'use_bf16', False):
+        cli_args += " --bf16"
     if not getattr(config, 'use_ema', True):
         cli_args += " --no-ema"
     if not getattr(config, 'use_tta', True):
@@ -556,8 +558,8 @@ def parse_args():
     parser.add_argument("--output-dir", default="results", help="Output directory")
     parser.add_argument("--checkpoint-dir", default="checkpoints", help="Checkpoint directory")
     parser.add_argument("--epochs", type=int, default=20, help="Number of training epochs")
-    parser.add_argument("--batch-size", type=int, default=4, help="Batch size")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--batch-size", type=int, default=4, help="Batch size per GPU")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate (paper: 0.001)")
     parser.add_argument("--num-workers", type=int, default=4, help="Data loader workers")
     parser.add_argument("--image-size", type=int, default=512, help="Image size for model input")
     parser.add_argument("--no-augmentation", action="store_true", help="Disable data augmentation")
@@ -570,6 +572,8 @@ def parse_args():
                         help="Score threshold for patient-level classification (default: 0.3)")
     parser.add_argument("--no-amp", action="store_true",
                         help="Disable Automatic Mixed Precision on CUDA")
+    parser.add_argument("--bf16", action="store_true",
+                        help="Use BFloat16 instead of Float16 (Ampere+ GPUs, no GradScaler needed)")
     parser.add_argument("--threads", type=int, default=0,
                         help="OpenMP threads for CPU parallelism (0=auto)")
 
@@ -593,7 +597,7 @@ def parse_args():
     parser.add_argument("--ema-decay", type=float, default=0.999,
                         help="EMA decay factor (default: 0.999)")
     parser.add_argument("--scheduler", choices=["cosine", "step"], default="cosine",
-                        help="LR scheduler type (default: cosine)")
+                        help="LR scheduler type (default: cosine, paper uses step)")
     parser.add_argument("--grad-accum", type=int, default=1,
                         help="Gradient accumulation steps (default: 1)")
     parser.add_argument("--multi-scale", action="store_true",
@@ -617,6 +621,11 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # CUDA allocator tuning (before any CUDA ops)
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    # Allow TF32 for matmuls on Ampere+ (faster, negligible precision loss)
+    torch.set_float32_matmul_precision("high")
+
     config = Config(
         data_dir=args.data_dir,
         output_dir=args.output_dir,
@@ -633,6 +642,7 @@ def main():
         force_device=args.device,
         patient_threshold=args.patient_threshold,
         use_amp=not args.no_amp,
+        use_bf16=args.bf16,
         num_threads=args.threads,
         # Performance
         resume=args.resume,

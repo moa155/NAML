@@ -4,14 +4,12 @@ Augmentation pipeline optimized for chest X-ray pneumonia detection:
   - CLAHE: Enhances local contrast in X-ray images (medical imaging standard)
   - RandomBrightnessContrast: Simulates exposure/gain variation
   - RandomGamma: Simulates display gamma differences
-  - HorizontalFlip: Anatomically valid (lungs are roughly symmetric)
+  - HorizontalFlip + VerticalFlip: Paper uses H+V flip + mirror for 8x expansion
+  - RandomResizedCrop: Scale jitter for robustness
   - ShiftScaleRotate: Minor position/scale/rotation changes (patient positioning)
   - GaussNoise/GaussianBlur: Simulates acquisition noise and defocus
   - GridDistortion/ElasticTransform: Simulates anatomical variation
   - CoarseDropout: Regularization via random occlusion
-
-No vertical flip — chest X-rays are always upright; flipping vertically is
-anatomically unrealistic and teaches the model incorrect patterns.
 
 Uses albumentations for robust bbox-consistent augmentation with automatic
 coordinate transformation for geometric augmentations.
@@ -118,8 +116,24 @@ def _build_train_pipeline():
         A.RandomGamma(gamma_limit=(80, 120), p=0.2)
     )
 
-    # --- Geometric augmentations ---
+    # --- Geometric augmentations (paper: H+V flip + mirror for 8x expansion) ---
     transforms.append(A.HorizontalFlip(p=0.5))
+    transforms.append(A.VerticalFlip(p=0.5))
+
+    # --- Random resized crop (scale jitter) ---
+    if _ALBU_V2:
+        transforms.append(
+            A.RandomResizedCrop(
+                size=(512, 512), scale=(0.8, 1.0), ratio=(0.9, 1.1), p=0.3,
+            )
+        )
+    else:
+        transforms.append(
+            A.RandomResizedCrop(
+                height=512, width=512, scale=(0.8, 1.0), ratio=(0.9, 1.1), p=0.3,
+            )
+        )
+
     if _ALBU_V2:
         transforms.append(
             A.Affine(
