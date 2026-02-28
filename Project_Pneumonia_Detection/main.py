@@ -151,7 +151,7 @@ def build_data_loaders(config: Config):
     )
     val_loader = DataLoader(
         val_dataset,
-        batch_size=config.batch_size * 4,  # 4x batch for eval (no gradients stored)
+        batch_size=config.batch_size * 2,  # 2x batch for eval (no gradients stored)
         shuffle=False,
         num_workers=n_workers,
         collate_fn=collate_fn,
